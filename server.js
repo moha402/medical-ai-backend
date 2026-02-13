@@ -1,8 +1,14 @@
 // server.js
 const express = require('express');
 const axios = require('axios');
+const cors = require('cors');
 const app = express();
 
+app.use(cors({
+  origin: '*', // Allow all origins (restrict in production)
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -154,4 +160,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Medical AI Backend running on port ${PORT}`);
   console.log(`📊 Cache: ${CACHE.size} questions`);
+
 });
