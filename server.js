@@ -87,6 +87,7 @@ RULES:
 
 Response:`;
 
+    // ✅ FIXED: Removed extra spaces in URL (critical fix!)
     const geminiResponse = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
       {
@@ -139,12 +140,21 @@ Response:`;
 
   } catch (error) {
     console.error("❌ Backend error:", error.message);
+    console.error("❌ Error details:", error.response?.data || error.config?.url || error.stack);
     
     // Handle quota errors gracefully
     if (error.response?.data?.error?.message?.includes('quota')) {
       return res.status(429).json({ 
         error: "Daily AI quota exceeded. Cached answers still available. Try again tomorrow.",
         quota_exceeded: true
+      });
+    }
+    
+    // Handle 404 errors (usually URL spacing issues)
+    if (error.response?.status === 404) {
+      return res.status(500).json({ 
+        error: "Gemini API URL misconfigured. Contact administrator.",
+        details: "Check for extra spaces in API URL"
       });
     }
     
@@ -159,6 +169,6 @@ Response:`;
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Medical AI Backend running on port ${PORT}`);
-  console.log(`📊 Cache: ${CACHE.size} questions`);
-
+  console.log(`📊 Cache initialized with ${CACHE.size} questions`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
 });
