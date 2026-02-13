@@ -1,4 +1,8 @@
 // server.js
+// ✅ FIXED: Gemini URL spacing errors
+// ✅ ADDED: Hugging Face fallback when Gemini fails
+// ✅ FEATURES: Intelligent fallback chain + shared cloud cache
+
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -24,7 +28,105 @@ app.get('/health', (req, res) => {
   });
 });
 
-// AI endpoint
+// ===== HUGGING FACE FALLBACK FUNCTION =====
+async function queryHuggingFace(question) {
+  const HF_API_KEY = process.env.HUGGINGFACE_API_KEY;
+  if (!HF_API_KEY) {
+    console.warn("⚠️ Hugging Face API key not configured");
+    return null;
+  }
+  
+  const prompt = `[INST] You are an expert medical educator. Provide a concise educational explanation for exam preparation only.
+
+Question: "${question}"
+
+Rules:
+- ONLY general medical knowledge for exams
+- NEVER personal advice/diagnosis/treatment
+- Include key pathophysiology when relevant
+- Keep under 150 words
+- End with: "For actual patient care, always consult a physician."
+
+Answer: [/INST]`;
+  
+  try {
+    const response = await axios.post(
+      'https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2',
+      {
+        inputs: prompt,
+        parameters: {
+          max_new_tokens: 350,
+          temperature: 0.3,
+          top_p: 0.95,
+          return_full_text: false,
+          stop: ["[/INST]", "Question:", "Rules:"]
+        }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${HF_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 25000 // 25 second timeout
+      }
+    );
+    
+    // Parse Mistral response
+    let answer = "";
+    if (Array.isArray(response.data) && response.data[0]?.generated_text) {
+      answer = response.data[0].generated_text;
+    } else if (response.data?.generated_text) {
+      answer = response.data.generated_text;
+    } else {
+      console.warn("Unexpected Hugging Face response format:", response.data);
+      return null;
+    }
+    
+    answer = answer.trim();
+    
+    // Clean up Mistral artifacts
+    answer = answer
+      .replace(/\[\/INST\].*/s, '')
+      .replace(/\[INST\].*?\[\/INST\]/gs, '')
+      .replace(/^(Answer:|Response:)\s*/i, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    
+    // Ensure educational ending
+    if (answer && !answer.toLowerCase().includes("consult a physician")) {
+      answer += "\n\nFor actual patient care, always consult a physician.";
+    }
+    
+    if (!answer || answer.length < 20) {
+      console.warn("Hugging Face returned empty or too short response");
+      return null;
+    }
+    
+    return answer;
+    
+  } catch (error) {
+    // Handle model loading state
+    if (error.response?.status === 503) {
+      const data = error.response?.data || {};
+      if (data.estimated_time) {
+        console.warn(`Hugging Face model loading - estimated ${Math.ceil(data.estimated_time)} seconds`);
+      }
+      console.warn("Hugging Face model loading - will retry later");
+      return null;
+    }
+    
+    // Handle auth errors
+    if (error.response?.status === 401) {
+      console.error("❌ Invalid Hugging Face API key");
+      return null;
+    }
+    
+    console.warn("Hugging Face error:", error.message);
+    return null;
+  }
+}
+
+// AI endpoint with Gemini → Hugging Face fallback
 app.post('/ai', async (req, res) => {
   try {
     const question = req.body.question?.trim();
@@ -64,8 +166,8 @@ app.post('/ai', async (req, res) => {
       });
     }
 
-    // ❌ CACHE MISS → Call Gemini API
-    console.log(`🔄 Cache miss: "${question}" - calling Gemini...`);
+    // ❌ CACHE MISS → Try Gemini FIRST
+    console.log(`🔄 Cache miss: "${question}" - trying Gemini...`);
     
     const GEMINI_KEY = process.env.GEMINI_KEY;
     if (!GEMINI_KEY) {
@@ -87,76 +189,111 @@ RULES:
 
 Response:`;
 
-    // ✅ FIXED: Removed extra spaces in URL (critical fix!)
-    const geminiResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,
-      {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { 
-          temperature: 0.3, 
-          maxOutputTokens: 800,
-          topP: 0.95
+    // ✅ FIXED: NO SPACES before colon in URL
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
+    
+    try {
+      const geminiResponse = await axios.post(
+        geminiUrl,
+        {
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { 
+            temperature: 0.3, 
+            maxOutputTokens: 800,
+            topP: 0.95
+          },
+          safetySettings: [
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" }
+          ]
         },
-        safetySettings: [
-          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" },
-          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" }
-        ]
-      },
-      { timeout: 10000 } // 10 second timeout
-    );
+        { timeout: 10000 } // 10 second timeout
+      );
 
-    // Extract answer
-    const candidate = geminiResponse.data.candidates?.[0];
-    if (!candidate || candidate.finishReason === "SAFETY") {
-      return res.status(400).json({ 
-        error: "Question blocked by safety filters. Ask strictly educational questions." 
+      // Extract answer
+      const candidate = geminiResponse.data.candidates?.[0];
+      if (!candidate || candidate.finishReason === "SAFETY") {
+        throw new Error("Blocked by safety filters");
+      }
+
+      const answer = candidate.content?.parts?.[0]?.text?.trim();
+      if (!answer || answer.length < 15) {
+        throw new Error("Empty response");
+      }
+
+      // ✅ CACHE FOR ALL FUTURE USERS
+      CACHE.set(cacheKey, answer);
+      
+      // Keep cache size reasonable (last 1,000 questions)
+      if (CACHE.size > 1000) {
+        const firstKey = CACHE.keys().next().value;
+        CACHE.delete(firstKey);
+      }
+
+      console.log(`✅ Cached from Gemini: "${question}" | Total cached: ${CACHE.size}`);
+      
+      return res.json({ 
+        answer, 
+        source: "gemini_2.5_flash",
+        cached: false,
+        cache_size: CACHE.size
+      });
+      
+    } catch (geminiError) {
+      // ✅ Gemini failed → Try Hugging Face as fallback
+      console.warn("⚠️ Gemini failed:", geminiError.message);
+      
+      // Handle quota errors specifically
+      if (geminiError.response?.data?.error?.message?.includes('quota') || 
+          geminiError.response?.status === 429) {
+        console.log(`🔄 Quota exceeded - trying Hugging Face fallback for: "${question}"`);
+      } else {
+        console.log(`🔄 Gemini error - trying Hugging Face fallback for: "${question}"`);
+      }
+      
+      const hfAnswer = await queryHuggingFace(question);
+      
+      if (hfAnswer) {
+        // ✅ CACHE Hugging Face answer
+        CACHE.set(cacheKey, hfAnswer);
+        if (CACHE.size > 1000) {
+          const firstKey = CACHE.keys().next().value;
+          CACHE.delete(firstKey);
+        }
+        
+        console.log(`✅ Cached from Hugging Face: "${question}" | Total cached: ${CACHE.size}`);
+        
+        return res.json({ 
+          answer: hfAnswer, 
+          source: "huggingface_mistral",
+          cached: false,
+          cache_size: CACHE.size
+        });
+      }
+      
+      // ❌ Both failed → Return error
+      console.error("❌ Both Gemini and Hugging Face failed for:", question);
+      
+      // Check if it's a quota error
+      if (geminiError.response?.data?.error?.message?.includes('quota') || 
+          geminiError.response?.status === 429) {
+        return res.status(429).json({ 
+          error: "Daily AI quota exceeded. Cached answers still available. Try again tomorrow.",
+          quota_exceeded: true
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: "AI temporarily unavailable. Try cached questions or common topics.",
+        details: "Both Gemini and Hugging Face failed"
       });
     }
-
-    const answer = candidate.content?.parts?.[0]?.text?.trim();
-    if (!answer || answer.length < 15) {
-      return res.status(500).json({ error: "Empty response from AI. Try rephrasing." });
-    }
-
-    // ✅ CACHE FOR ALL FUTURE USERS
-    CACHE.set(cacheKey, answer);
-    
-    // Keep cache size reasonable (last 1,000 questions)
-    if (CACHE.size > 1000) {
-      const firstKey = CACHE.keys().next().value;
-      CACHE.delete(firstKey);
-    }
-
-    console.log(`✅ Cached: "${question}" | Total cached: ${CACHE.size}`);
-    
-    res.json({ 
-      answer, 
-      source: "gemini_2.5_flash",
-      cached: false,
-      cache_size: CACHE.size
-    });
 
   } catch (error) {
     console.error("❌ Backend error:", error.message);
     console.error("❌ Error details:", error.response?.data || error.config?.url || error.stack);
-    
-    // Handle quota errors gracefully
-    if (error.response?.data?.error?.message?.includes('quota')) {
-      return res.status(429).json({ 
-        error: "Daily AI quota exceeded. Cached answers still available. Try again tomorrow.",
-        quota_exceeded: true
-      });
-    }
-    
-    // Handle 404 errors (usually URL spacing issues)
-    if (error.response?.status === 404) {
-      return res.status(500).json({ 
-        error: "Gemini API URL misconfigured. Contact administrator.",
-        details: "Check for extra spaces in API URL"
-      });
-    }
     
     res.status(500).json({ 
       error: "AI temporarily unavailable. Try again in a few minutes.",
@@ -168,7 +305,8 @@ Response:`;
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Medical AI Backend running on port ${PORT}`);
+  console.log(`✅ Medical AI Backend v2.0 running on port ${PORT}`);
   console.log(`📊 Cache initialized with ${CACHE.size} questions`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`✨ Features: Gemini + Hugging Face fallback | Shared cloud cache`);
 });
